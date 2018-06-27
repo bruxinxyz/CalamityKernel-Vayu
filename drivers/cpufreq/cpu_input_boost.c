@@ -48,6 +48,7 @@ struct boost_drv {
 	struct delayed_work max_unboost;
 	struct notifier_block cpu_notif;
 	struct notifier_block fb_notif;
+	unsigned long max_boost_expires;
 	atomic_t max_boost_dur;
 	spinlock_t lock;
 	u32 state;
@@ -169,22 +170,33 @@ void cpu_input_boost_kick(void)
 	queue_work(b->wq, &b->input_boost);
 }
 
+static void __cpu_input_boost_kick_max(struct boost_drv *b,
+	unsigned int duration_ms)
+{
+	unsigned long new_expires;
+
+	/* Skip this boost if there's already a longer boost in effect */
+	spin_lock(&b->lock);
+	new_expires = jiffies + msecs_to_jiffies(duration_ms);
+	if (time_after(b->max_boost_expires, new_expires)) {
+		spin_unlock(&b->lock);
+		return;
+	}
+	b->max_boost_expires = new_expires;
+	spin_unlock(&b->lock);
+
+	atomic_set(&b->max_boost_dur, duration_ms);
+	queue_work(b->wq, &b->max_boost);
+}
+
 void cpu_input_boost_kick_max(unsigned int duration_ms)
 {
 	struct boost_drv *b = boost_drv_g;
-	u32 state;
 
 	if (!b)
 		return;
 
-	state = get_boost_state(b);
-
-	/* Don't mess with wake boosts */
-	if (state & WAKE_BOOST)
-		return;
-
-	atomic_set(&b->max_boost_dur, duration_ms);
-	queue_work(b->wq, &b->max_boost);
+	__cpu_input_boost_kick_max(b, duration_ms);
 }
 
 static void input_boost_worker(struct work_struct *work)
@@ -320,8 +332,11 @@ static int msm_drm_notifier_cb(struct notifier_block *nb, unsigned long action,
 
 	if (*blank == FB_BLANK_UNBLANK) {
 		set_boost_bit(b, SCREEN_AWAKE);
+
 		atomic_set(&b->max_boost_dur, CONFIG_INPUT_BOOST_DURATION_MS);
 		queue_work(b->wq, &b->max_boost);
+
+		__cpu_input_boost_kick_max(b, CONFIG_WAKE_BOOST_DURATION_MS);
 
 	} else {
 		set_bit(SCREEN_OFF, &b->state);
